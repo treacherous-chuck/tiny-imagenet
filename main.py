@@ -19,26 +19,25 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from torch.utils.tensorboard import SummaryWriter
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR', default='imagenet',
-                    help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=1, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=30, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=32, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -77,11 +76,11 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 
 best_acc1 = 0
-
+writer = SummaryWriter()
 
 def main():
     args = parser.parse_args()
-
+    
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -137,6 +136,9 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+    
+    # 将 output 修改为 200 维
+    model.fc = nn.Linear(model.fc.in_features,200)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -205,16 +207,20 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
+    train_dir = r"tiny-imagenet-200\train"
+    if not os.path.exists(r"tiny-imagenet-200\new_val"):
+        print("is generating a new dataset from val")
+        generate_new_val()
+    val_dir = r"tiny-imagenet-200\new_val"
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
     train_dataset = datasets.ImageFolder(
-        traindir,
+        train_dir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+            #删去图片的裁剪和翻转的部分
+            #transforms.RandomResizedCrop(224),
+            #transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -229,9 +235,9 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
 
     val_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+        datasets.ImageFolder(val_dir, transforms.Compose([
+            #transforms.Resize(256),
+            #transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ])),
@@ -247,13 +253,17 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        loss_train,acc5_train = train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        loss_val,acc5_val,acc1 = validate(val_loader, model, criterion, args)
         
         scheduler.step()
 
+        writer.add_scalar('Loss/train', loss_train, epoch)
+        writer.add_scalar('Loss/test', loss_val, epoch)
+        writer.add_scalar('Accuracy/train', acc5_train, epoch)
+        writer.add_scalar('Accuracy/test', acc5_val, epoch)
         
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -269,6 +279,16 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
                 'scheduler' : scheduler.state_dict()
             }, is_best)
+        #每5个epoch保存一次checkpoint
+        if epoch % 5 == 0 and epoch > 1:
+             save_checkpoint({
+                'epoch': epoch + 1,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'best_acc1': best_acc1,
+                'optimizer' : optimizer.state_dict(),
+                'scheduler' : scheduler.state_dict()
+            }, is_best,"checkpoint_epoch{}.pth.tar".format(epoch))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -316,6 +336,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    return loss,top5.avg
 
 
 def validate(val_loader, model, criterion, args):
@@ -342,6 +363,7 @@ def validate(val_loader, model, criterion, args):
             # compute output
             output = model(images)
             loss = criterion(output, target)
+            
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -355,10 +377,9 @@ def validate(val_loader, model, criterion, args):
 
             if i % args.print_freq == 0:
                 progress.display(i)
-
         progress.display_summary()
 
-    return top1.avg
+    return loss,top5.avg,top1.avg
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -449,6 +470,25 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+def generate_new_val():
+    dict = {}#图片类型的字典
+    with open(r"tiny-imagenet-200\val\val_annotations.txt","r") as val_ann:
+        whole_lines = val_ann.readlines()#读取全部内容
+    for a_line in whole_lines:
+        image_name = a_line.split("\t")[0]#读取图片名称
+        type = a_line.split("\t")[1]#读取该图片的类别
+        if type not in dict:
+            dict[type] = [image_name]
+        else:
+            dict[type] += [image_name]
+    for type in dict:
+        path = r"tiny-imagenet-200\new_val\{}\images\\".format(type)
+        if not os.path.exists(path):
+            os.makedirs(path)#生成路径
+        for ind,image_name in enumerate(dict[type]):
+            new_image = r"tiny-imagenet-200\new_val\{}\images\{}_{}.JPEG".format(type,type,ind)
+            old_image = r"tiny-imagenet-200\val\images\{}".format(image_name)
+            shutil.copyfile(old_image,new_image)#生成全新名称的图片文件      
 
 if __name__ == '__main__':
     main()
